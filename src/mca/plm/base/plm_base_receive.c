@@ -85,6 +85,13 @@ int prte_plm_base_comm_start(void)
         prte_rml.recv_buffer_nb(PRTE_NAME_WILDCARD, PRTE_RML_TAG_TOPOLOGY_REPORT,
                                 PRTE_RML_PERSISTENT, prte_plm_base_daemon_topology, NULL);
     }
+    else { //ssumiext
+      extern void prte_daemon_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
+				   prte_rml_tag_t tag, void *cbdata);
+      /* setup the primary daemon command receive function */
+      prte_rml.recv_buffer_nb(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON, PRTE_RML_PERSISTENT,
+			      prte_daemon_recv, NULL);
+    }
     recv_issued = true;
 
     return PRTE_SUCCESS;
