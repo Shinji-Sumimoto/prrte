@@ -679,7 +679,7 @@ void prte_state_base_track_procs(int fd, short argc, void *cbdata)
             goto cleanup;
         }
         /* track job status */
-        jdata->num_terminated++;
+        //jdata->num_terminated++; //ssumi-ext
         if (jdata->num_terminated == jdata->num_procs) {
             /* if requested, check fd status for leaks */
             if (prte_state_base_run_fdcheck) {

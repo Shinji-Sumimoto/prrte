@@ -191,6 +191,8 @@ BEGIN_C_DECLS
 /* error propagate  */
 #define PRTE_RML_TAG_PROPAGATE 71
 
+#define PRTE_RML_TAG_DAEMON_EXT             72 //ssumiext
+
 #define PRTE_RML_TAG_MAX 100
 
 #define PRTE_RML_TAG_NTOH(t) ntohl(t)

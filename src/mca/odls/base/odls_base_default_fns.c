@@ -150,6 +150,167 @@ done:
     PRTE_PMIX_WAKEUP_THREAD(&cd->lock);
 }
 
+#ifndef ssumiext
+static int pack_state_for_proc(pmix_data_buffer_t *alert, prte_proc_t *child)
+{
+    int rc;
+
+    /* pack the child's vpid */
+    rc = PMIx_Data_pack(NULL, alert, &child->name.rank, 1, PMIX_PROC_RANK);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+    /* pack the pid */
+    rc = PMIx_Data_pack(NULL, alert, &child->pid, 1, PMIX_PID);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+    /* pack its state */
+    rc = PMIx_Data_pack(NULL, alert, &child->state, 1, PMIX_UINT32);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+    /* pack its exit code */
+    rc = PMIx_Data_pack(NULL, alert, &child->exit_code, 1, PMIX_INT32);
+    if (PMIX_SUCCESS != rc) {
+        PMIX_ERROR_LOG(rc);
+        return rc;
+    }
+
+    return PRTE_SUCCESS;
+}
+
+static void normal_register_cbfunc(int status, size_t errhndler, void *cbdata)
+{
+  prte_output_verbose(5, prte_odls_base_framework.framework_output,
+		      "odls:base:event normal term cbfunc with status %d ", status);
+}
+
+static void normal_notify_cbfunc(size_t evhdlr_registration_id, pmix_status_t status,
+                                const pmix_proc_t *source, pmix_info_t info[], size_t ninfo,
+                                pmix_info_t *results, size_t nresults,
+                                pmix_event_notification_cbfunc_fn_t cbfunc, void *cbdata)
+{
+    pmix_proc_t proc;
+    int rc;
+    prte_proc_t *temp_prte_proc;
+    pmix_data_buffer_t *alert;
+    prte_job_t *jdata;
+    prte_plm_cmd_flag_t cmd;
+    size_t n;
+
+    prte_output_verbose(5, prte_odls_base_framework.framework_output,
+			 "%s odls:dvm:normal_notify_cbfunc called",
+			 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME) );
+
+    if (NULL != info) {
+        for (n = 0; n < ninfo; n++) {
+            if (0 == strncmp(info[n].key, PMIX_EVENT_AFFECTED_PROC, PMIX_MAX_KEYLEN)) {
+                PMIX_XFER_PROCID(&proc, info[n].value.data.proc);
+
+                PRTE_OUTPUT_VERBOSE(
+		    (5, prte_odls_base_framework.framework_output,
+                     "%s odls:base:normal proc %s with key-value %s notified from %s",
+                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc), info[n].key,
+                     PRTE_NAME_PRINT(source)));
+
+                if (prte_get_proc_daemon_vpid(&proc) != PRTE_PROC_MY_NAME->rank) {
+                    PRTE_OUTPUT_VERBOSE(
+			(5, prte_odls_base_framework.framework_output,
+                         "%s odls:base:normal_notify_callback vpid mismatch - ignoring error",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                    continue;
+                }
+
+                if (NULL == (jdata = prte_get_job_data_object(proc.nspace))) {
+                    /* must already be complete */
+                    PRTE_OUTPUT_VERBOSE(
+			(5, prte_odls_base_framework.framework_output,
+                         "%s odls:base:normal_notify_callback NULL jdata - ignoring error",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                    continue;
+                }
+                if (NULL
+                    == (temp_prte_proc = (prte_proc_t *) prte_pointer_array_get_item(jdata->procs,
+                                                                                     proc.rank))) {
+                    PRTE_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output,
+                                         "%s odls:base:normal_notify_callback NULL "
+                                         "jdata->procs - ignoring error",
+                                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                    continue;
+                }
+
+                PMIX_DATA_BUFFER_CREATE(alert);
+                /* pack update state command */
+		cmd = PRTE_PLM_UPDATE_SLOT_CMD; // PRTE_PLM_UPDATE_PROC_STATE; 
+                rc = PMIx_Data_pack(NULL, alert, &cmd, 1, PMIX_UINT8);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    PMIX_DATA_BUFFER_RELEASE(alert);
+                    return;
+                }
+
+                /* pack jobid */
+                rc = PMIx_Data_pack(NULL, alert, &proc.nspace, 1, PMIX_PROC_NSPACE);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    PMIX_DATA_BUFFER_RELEASE(alert);
+                    return;
+                }
+
+                /* proc state now is PRTE_PROC_STATE_ABORTED_BY_SIG, cause odls set state to this;
+                 * code is 128+9 */
+		temp_prte_proc->state = PRTE_PROC_STATE_TERMINATED;
+                /* now pack the child's info */
+                if (PMIX_SUCCESS != (rc = pack_state_for_proc(alert, temp_prte_proc))) {
+                    PMIX_ERROR_LOG(rc);
+                    PMIX_DATA_BUFFER_RELEASE(alert);
+                    return;
+                }
+
+		PRTE_OUTPUT_VERBOSE( (5, prte_odls_base_framework.framework_output,
+				      "%s odls:base:def: send to hnp",
+				      PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                /* send this process's info to hnp */
+                if (0 > (rc = prte_rml.send_buffer_nb(PRTE_PROC_MY_HNP, alert, PRTE_RML_TAG_PLM,
+                                                      prte_rml_send_callback, NULL))) {
+                    PRTE_OUTPUT_VERBOSE( (5, prte_odls_base_framework.framework_output,
+                                         "%s odls:base:def: send to hnp failed",
+                                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                    PRTE_ERROR_LOG(rc);
+                    PMIX_DATA_BUFFER_RELEASE(alert);
+                }
+#ifdef notne
+                if (PRTE_FLAG_TEST(temp_prte_proc, PRTE_PROC_FLAG_IOF_COMPLETE)
+                    && PRTE_FLAG_TEST(temp_prte_proc, PRTE_PROC_FLAG_WAITPID)
+                    && !PRTE_FLAG_TEST(temp_prte_proc, PRTE_PROC_FLAG_RECORDED)) {
+                    PRTE_ACTIVATE_PROC_STATE(&proc, PRTE_PROC_STATE_TERMINATED);
+                }
+#endif
+
+                //prte_propagate.prp(source->nspace, source, &proc, PRTE_ERR_PROC_ABORTED);
+                break;
+            }
+        }
+    }
+    if (NULL != cbfunc) {
+      cbfunc(PRTE_SUCCESS, NULL, 0, NULL, NULL, cbdata);
+    }
+}
+
+static void prte_state_register_termprocs(prte_proc_t *proc)
+{//ssumi-ext
+  pmix_status_t pcode = PMIX_EVENT_TERMINATE; //PMIX_PROC_TERMINATED;
+  prte_output_verbose(5, prte_odls_base_framework.framework_output,
+		       "%s odls:base:norma_term called callback %s register evhandler in PMIX_PROC_TERMINATED",
+		       PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT((proc? proc: "NULL")));
+  PMIx_Register_event_handler(&pcode, 1, NULL, 0, normal_notify_cbfunc, normal_register_cbfunc, NULL);
+}
+#endif
+
 /* IT IS CRITICAL THAT ANY CHANGE IN THE ORDER OF THE INFO PACKED IN
  * THIS FUNCTION BE REFLECTED IN THE CONSTRUCT_CHILD_LIST PARSER BELOW
  */
@@ -1454,6 +1615,7 @@ void prte_odls_base_default_launch_local(int fd, short sd, void *cbdata)
             prte_event_active(&cd->ev, PRTE_EV_WRITE, 1);
         }
     }
+    prte_state_register_termprocs(NULL);// ssumi-ext
 
 GETOUT:
 
@@ -1608,6 +1770,29 @@ void prte_odls_base_default_wait_local_proc(int fd, short sd, void *cbdata)
 
     /* determine the state of this process */
     if (WIFEXITED(proc->exit_code)) {
+#ifndef ssumiext
+      {
+            /* register an event handler for the PRTE_ERR_PROC_ABORTED event */
+            int rc;
+	    pmix_status_t pcode = PMIX_EVENT_TERMINATE; //PRTE_PROC_STATE_TERMINATED;
+            pmix_info_t *pinfo;
+            PMIX_INFO_CREATE(pinfo, 1);
+            PMIX_INFO_LOAD(&pinfo[0], PMIX_EVENT_AFFECTED_PROC, &proc->name, PMIX_PROC);
+
+            PRTE_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output,
+                                 "%s odls:event call PMIx_Notify_event in odls proc %s teminated",
+                                 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(&proc->name)));
+            if (PRTE_SUCCESS
+                != PMIx_Notify_event(pcode, PRTE_PROC_MY_NAME, PMIX_RANGE_LOCAL, pinfo, 1, NULL,
+                                     NULL)) {
+                PRTE_OUTPUT_VERBOSE((5, prte_odls_base_framework.framework_output,
+                                     "%s odls:notify failed, release pinfo",
+                                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+                PRTE_RELEASE(pinfo);
+            }
+            PRTE_FLAG_SET(proc, PRTE_PROC_FLAG_WAITPID);
+        }
+#endif
 
         /* set the exit status appropriately */
         proc->exit_code = WEXITSTATUS(proc->exit_code);

@@ -504,7 +504,8 @@ static void track_procs(int fd, short argc, void *cbdata)
             goto cleanup;
         }
         /* track job status */
-        if (jdata->num_terminated == jdata->num_local_procs
+        if (//jdata->num_terminated == jdata->num_local_procs && //ssumi-ext
+	    jdata->num_terminated == jdata->num_procs //ssumi-ext
             && !prte_get_attribute(&jdata->attributes, PRTE_JOB_TERM_NOTIFIED, NULL, PMIX_BOOL)) {
             /* pack update state command */
             cmd = PRTE_PLM_UPDATE_PROC_STATE;

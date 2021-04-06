@@ -63,8 +63,225 @@
 #include "src/mca/plm/base/plm_private.h"
 #include "src/mca/plm/plm.h"
 #include "src/mca/plm/plm_types.h"
+#include "src/mca/rmaps/rmaps_types.h"
+#include "src/mca/grpcomm/grpcomm.h"
 
 static bool recv_issued = false;
+
+#ifndef ssumiext
+static char *_get_prted_comm_cmd_str(int command)
+{
+    switch (command) {
+    case PRTE_DAEMON_REPORT_PROC_INFO_CMD:
+        return strdup("PRTE_DAEMON_REPORT_PROC_INFO_CMD");
+
+    default:
+        return strdup("Unknown Command!");
+    }
+}
+
+static void _notify_release(pmix_status_t status, void *cbdata)
+{
+    prte_pmix_lock_t *lk = (prte_pmix_lock_t *) cbdata;
+
+    PRTE_PMIX_WAKEUP_THREAD(lk);
+}
+
+void prte_daemon_recv_ext(int status, pmix_proc_t *sender, pmix_data_buffer_t *buffer,
+                      prte_rml_tag_t tag, void *cbdata) // ssumiext
+{
+    prte_daemon_cmd_flag_t command;
+    int ret;
+    int32_t n;
+    pmix_nspace_t job;
+    prte_job_t *jdata;
+    pmix_proc_t proc;
+    int32_t i, num_replies;
+    prte_proc_t *proct;
+    char *cmd_str = NULL;
+    prte_node_t *node;
+    prte_job_map_t *map;
+    prte_pmix_lock_t lk;
+    pmix_proc_t pname;
+    int rank;
+
+    /* unpack the command */
+    n = 1;
+    ret = PMIx_Data_unpack(NULL, buffer, &command, &n, PMIX_UINT8);
+    if (PMIX_SUCCESS != ret) {
+        PMIX_ERROR_LOG(ret);
+        return;
+    }
+
+    cmd_str = _get_prted_comm_cmd_str(command);
+    PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+                         "%s prted:comm:process_commands() of Tag %d Processing Command: %s",
+                         PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_RML_TAG_DAEMON_EXT, cmd_str));
+    free(cmd_str);
+    cmd_str = NULL;
+
+    /* now process the command locally */
+    switch (command) {
+    case PRTE_DAEMON_REPORT_PROC_INFO_CMD:
+        PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+			   "%s prted:comm:pass_procs_info enter.",
+			   PRTE_NAME_PRINT(PRTE_PROC_MY_NAME)));
+        /* unpack the jobid */
+        n = 1;
+        ret = PMIx_Data_unpack(NULL, buffer, &job, &n, PMIX_PROC_NSPACE);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            goto CLEANUP;
+        }
+
+        /* look up job data object */
+        ret = PMIx_Data_unpack(NULL, buffer, &rank, &n, PMIX_INT32);
+        if (PMIX_SUCCESS != ret) {
+            PMIX_ERROR_LOG(ret);
+            goto CLEANUP;
+        }
+
+        /* look up job data object */
+        if (NULL == (jdata = prte_get_job_data_object(job))) {
+            /* we can safely ignore this request as the job
+             * was already cleaned up, or it was a tool */
+            goto CLEANUP;
+        }
+#ifndef notuse
+        if (NULL != jdata->map) {
+            map = (prte_job_map_t*)jdata->map;
+            for (n = 0; n < map->nodes->size; n++) {
+                if (NULL == (node = (prte_node_t*)prte_pointer_array_get_item(map->nodes, n))) {
+                    continue;
+                }
+                for (i = 0; i < node->procs->size; i++) {
+                    if (NULL == (proct = (prte_proc_t*)prte_pointer_array_get_item(node->procs, i))) {
+                        continue;
+                    }
+                    if (strcmp(proct->name.nspace, jdata->nspace)) {
+                        /* skip procs from another job */
+                        continue;
+                    }
+		    /* needs to check proc id */
+                    if (proct->rank != rank) {
+                        /* skip procs from another job */
+                        continue;
+                    }
+		    PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+					 "%s prted:comm:pass_procs_info checking  (job=%s/rank%d)[inuse=%2d /nprocs %2d]",
+					 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+					 jdata->nspace, rank, node->slots_inuse, node->num_procs));
+		    
+                    if (!PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_TOOL)) {
+		      if (!PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_RECORDED)) {
+			if(node->slots_inuse > 0) {
+			  node->slots_inuse--;
+			}
+			if(node->num_procs > 0) {
+			  node->num_procs--;
+			}
+			PRTE_FLAG_SET(proct, PRTE_PROC_FLAG_RECORDED);
+			prte_pointer_array_set_item(node->procs, i, NULL);
+
+			PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+					     "%s prted:comm:pass_procs_info (job=%s/rank%d)[inuse=%2d /nprocs %2d]",
+					     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+					     jdata->nspace, rank, node->slots_inuse, node->num_procs));
+#ifndef notuse
+			/* deregister this proc - will be ignored if already done */
+			PRTE_PMIX_CONSTRUCT_LOCK(&lk);
+			pname.rank = proct->name.rank;
+			PMIx_server_deregister_client(&pname, _notify_release, &lk);
+			PRTE_PMIX_WAIT_THREAD(&lk);
+			PRTE_PMIX_DESTRUCT_LOCK(&lk);
+			/* set the entry in the node array to NULL */
+			prte_pointer_array_set_item(node->procs, i, NULL);
+			/* release the proc once for the map entry */
+			PRTE_RELEASE(proct);
+#endif
+		      }
+		    }
+                }
+            }
+        }
+#endif
+
+#ifndef moredo
+	//prte_pointer_array_t *prte_node_pool = NULL;
+
+	if (NULL != prte_node_pool) {
+	  for (n = 0; n < prte_node_pool->size; n++) {
+	    if (NULL == (node = (prte_node_t*)prte_pointer_array_get_item(prte_node_pool, n))) {
+	      continue;
+	    }
+	    PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+				 "%s prted:comm:pass_procs_info checking=top(job=%s/rank%d)[node=%p/size %2d]",
+				 PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+				 jdata->nspace, rank, node, node->procs->size));
+	    for (i = 0; i < node->procs->size; i++) {
+	      if (NULL == (proct = (prte_proc_t*)prte_pointer_array_get_item(node->procs, i))) {
+		continue;
+	      }
+	      if (strcmp(proct->name.nspace, jdata->nspace)) {
+		/* skip procs from another job */
+		continue;
+	      }
+	      /* needs to check proc id */
+	      if (proct->rank != rank) {
+		/* skip procs from another job */
+		continue;
+	      }
+	      PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+				   "%s prted:comm:pass_procs_info checking=top(job=%s/rank%d)[inuse=%2d /nprocs %2d]",
+				   PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+				   jdata->nspace, rank, node->slots_inuse, node->num_procs));
+		    
+	      if (!PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_TOOL)) {
+		//if (!PRTE_FLAG_TEST(proct, PRTE_PROC_FLAG_RECORDED)) 
+		  {
+		  if(node->slots_inuse > 0) {
+		    node->slots_inuse--;
+		  }
+		  if(node->num_procs > 0) {
+		    node->num_procs--;
+		  }
+		  //PRTE_FLAG_SET(proct, PRTE_PROC_FLAG_RECORDED);
+		  prte_pointer_array_set_item(node->procs, i, NULL);
+
+		  PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+				       "%s prted:comm:pass_procs_info=top(job=%s/rank%d)[inuse=%2d /nprocs %2d]",
+				       PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+				       jdata->nspace, rank, node->slots_inuse, node->num_procs));
+#ifndef notuse
+		  /* deregister this proc - will be ignored if already done */
+		  PRTE_PMIX_CONSTRUCT_LOCK(&lk);
+		  pname.rank = proct->name.rank;
+		  PMIx_server_deregister_client(&pname, _notify_release, &lk);
+		  PRTE_PMIX_WAIT_THREAD(&lk);
+		  PRTE_PMIX_DESTRUCT_LOCK(&lk);
+		  /* set the entry in the node array to NULL */
+		  prte_pointer_array_set_item(node->procs, i, NULL);
+		  /* release the proc once for the map entry */
+		  PRTE_RELEASE(proct);
+#endif
+		}
+	      }
+	    }
+	  }
+        }
+#endif
+        //PRTE_RELEASE(jdata);
+        break;
+
+    default:
+        PRTE_ERROR_LOG(PRTE_ERR_BAD_PARAM);
+    }
+
+CLEANUP:
+    return;
+}
+
+#endif
 
 int prte_plm_base_comm_start(void)
 {
@@ -84,6 +301,11 @@ int prte_plm_base_comm_start(void)
                                 PRTE_RML_PERSISTENT, prte_plm_base_daemon_failed, NULL);
         prte_rml.recv_buffer_nb(PRTE_NAME_WILDCARD, PRTE_RML_TAG_TOPOLOGY_REPORT,
                                 PRTE_RML_PERSISTENT, prte_plm_base_daemon_topology, NULL);
+    }
+    if (PRTE_PROC_IS_DAEMON) { //ssumiext
+      /* setup the primary daemon command receive function */
+      prte_rml.recv_buffer_nb(PRTE_NAME_WILDCARD, PRTE_RML_TAG_DAEMON_EXT, PRTE_RML_PERSISTENT,
+			      prte_daemon_recv_ext, NULL);
     }
     recv_issued = true;
 
@@ -371,6 +593,10 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buf
             /* get the job object */
             jdata = prte_get_job_data_object(job);
             count = 1;
+            prte_output_verbose(5, prte_plm_base_framework.framework_output,
+                                "%s plm:base:receive got update_proc_state for job data %s",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(job));
+
             while (PMIX_SUCCESS
                    == (rc = PMIx_Data_unpack(NULL, buffer, &vpid, &count, PMIX_PROC_RANK))) {
                 if (PMIX_RANK_INVALID == vpid) {
@@ -469,6 +695,184 @@ void prte_plm_base_recv(int status, pmix_proc_t *sender, pmix_data_buffer_t *buf
             count = 1;
         }
         break;
+#ifndef ssumiext
+    case PRTE_PLM_UPDATE_SLOT_CMD: // ssumi extension
+      //++++++++++++
+        prte_output_verbose(5, prte_plm_base_framework.framework_output,
+                            "%s plm:base:receive update proc slot from %s",
+                            PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_NAME_PRINT(sender));
+        count = 1;
+        rc = PMIx_Data_unpack(NULL, buffer, &job, &count, PMIX_PROC_NSPACE);
+        while (PMIX_SUCCESS == rc) {
+            prte_output_verbose(5, prte_plm_base_framework.framework_output,
+                                "%s plm:base:receive got update_proc_slot for job %s",
+                                PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), PRTE_JOBID_PRINT(job));
+
+            PMIX_LOAD_NSPACE(name.nspace, job);
+            running = false;
+            /* get the job object */
+            jdata = prte_get_job_data_object(job);
+            count = 1;
+            while (PMIX_SUCCESS
+                   == (rc = PMIx_Data_unpack(NULL, buffer, &vpid, &count, PMIX_PROC_RANK))) {
+                if (PMIX_RANK_INVALID == vpid) {
+                    /* flag indicates that this job is complete - move on */
+                    break;
+                }
+                name.rank = vpid;
+                /* unpack the pid */
+                count = 1;
+                rc = PMIx_Data_unpack(NULL, buffer, &pid, &count, PMIX_PID);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto CLEANUP;
+                }
+                /* unpack the state */
+                count = 1;
+                rc = PMIx_Data_unpack(NULL, buffer, &state, &count, PMIX_UINT32);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto CLEANUP;
+                }
+                if (PRTE_PROC_STATE_RUNNING == state) {
+                    running = true;
+                }
+                /* unpack the exit code */
+                count = 1;
+                rc = PMIx_Data_unpack(NULL, buffer, &exit_code, &count, PMIX_INT32);
+                if (PMIX_SUCCESS != rc) {
+                    PMIX_ERROR_LOG(rc);
+                    goto CLEANUP;
+                }
+
+                PRTE_OUTPUT_VERBOSE(
+                    (5, prte_plm_base_framework.framework_output,
+                     "%s plm:base:receive got update_proc_slot for vpid %u state %s exit_code %d",
+                     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME), vpid, prte_proc_state_to_str(state),
+                     (int) exit_code));
+
+                if (NULL != jdata) {
+		  prte_node_t *node;
+                    /* get the proc data object */
+                    if (NULL
+                        == (proc = (prte_proc_t *) prte_pointer_array_get_item(jdata->procs,
+                                                                               vpid))) {
+                        PRTE_ERROR_LOG(PRTE_ERR_NOT_FOUND);
+                        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_FORCED_EXIT);
+                        goto CLEANUP;
+                    }
+		    //ssumi-ext
+		    if (!PRTE_FLAG_TEST(proc, PRTE_PROC_FLAG_RECORDED)) {
+		      if(proc->node) {
+			node = proc->node;
+			if(node->slots_inuse > 0 ) {
+			  pmix_data_buffer_t cmd;
+			  prte_daemon_cmd_flag_t command = PRTE_DAEMON_REPORT_PROC_INFO_CMD;
+			  prte_grpcomm_signature_t *sig;
+
+			  PRTE_FLAG_SET(proc, PRTE_PROC_FLAG_RECORDED);
+			  jdata->num_terminated++;
+
+			  node->slots_inuse--;
+			  node->num_procs--;
+			  prte_pointer_array_set_item(node->procs, vpid, NULL);
+		  
+			  PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+					       "%s plm:base:receive cmd decreasing proc %s to %d/%d/%d(trm%d) from node %s",
+					       PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+					       PRTE_NAME_PRINT(&proc->name), 
+					       node->slots, node->slots_inuse, node->num_procs, 
+					       jdata->num_terminated, node->name));
+			  {
+			    PMIX_DATA_BUFFER_CONSTRUCT(&cmd);
+
+			    /* pack the command */
+			    rc = PMIx_Data_pack(NULL, &cmd, &command, 1, PMIX_UINT8);
+			    if (PMIX_SUCCESS != rc) {
+			      PMIX_ERROR_LOG(rc);
+			      PMIX_DATA_BUFFER_DESTRUCT(&cmd);
+			      return rc;
+			    }
+
+			    /* pack the jobid */
+			    rc = PMIx_Data_pack(NULL, &cmd, &jdata->nspace, 1, PMIX_PROC_NSPACE);
+			    if (PMIX_SUCCESS != rc) {
+			      PMIX_ERROR_LOG(rc);
+			      PMIX_DATA_BUFFER_DESTRUCT(&cmd);
+			      return rc;
+			    }
+
+			    /* pack the rank */
+			    rc = PMIx_Data_pack(NULL, &cmd, &proc->rank, 1, PMIX_INT32);
+			    if (PMIX_SUCCESS != rc) {
+			      PMIX_ERROR_LOG(rc);
+			      PMIX_DATA_BUFFER_DESTRUCT(&cmd);
+			      return rc;
+			    }
+
+			    /* goes to all daemons */
+			    sig = PRTE_NEW(prte_grpcomm_signature_t);
+			    sig->signature = (pmix_proc_t *) malloc(sizeof(pmix_proc_t));
+			    sig->sz = 1;
+			    PMIX_LOAD_PROCID(&sig->signature[0], PRTE_PROC_MY_NAME->nspace, PMIX_RANK_WILDCARD);
+			    if (PRTE_SUCCESS != (rc = prte_grpcomm.xcast(sig, PRTE_RML_TAG_DAEMON_EXT, &cmd))) {
+			      PRTE_ERROR_LOG(rc);
+			    }
+			    PMIX_DATA_BUFFER_DESTRUCT(&cmd);
+			    PRTE_RELEASE(sig);
+			  }
+			}
+		      }
+		      else {
+			if (!PRTE_FLAG_TEST(proc, PRTE_PROC_FLAG_RECORDED)) {
+			  PRTE_FLAG_SET(proc, PRTE_PROC_FLAG_RECORDED);
+			  jdata->num_terminated++;
+			}
+
+			PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+					     "%s plm:base:receive slot cmd called but not positive proc %s to %d/%d t=%d from node %s",
+					     PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+					     PRTE_NAME_PRINT(&proc->name), node->slots, 
+					     node->slots_inuse, jdata->num_terminated, node->name));
+		      }
+		    }
+		    else {
+		      PRTE_OUTPUT_VERBOSE((5, prte_plm_base_framework.framework_output,
+					   "%s plm:base:receive %s:job=%p, node=%p error",
+					   PRTE_NAME_PRINT(PRTE_PROC_MY_NAME),
+					   PRTE_NAME_PRINT(&proc->name), proc->node ));
+		    }
+		    //ssumi-ext end
+                    /* NEVER update the proc state before activating the state machine - let
+                     * the state cbfunc update it as it may need to compare this
+                     * state against the prior proc state */
+                    proc->pid = pid;
+                    proc->exit_code = exit_code;
+                    PRTE_ACTIVATE_PROC_STATE(&name, state);
+                }
+            }
+            /* record that we heard back from a daemon during app launch */
+            if (running && NULL != jdata) {
+                jdata->num_daemons_reported++;
+                if (prte_report_launch_progress) {
+                    if (0 == jdata->num_daemons_reported % 100
+                        || jdata->num_daemons_reported == prte_process_info.num_daemons) {
+                        PRTE_ACTIVATE_JOB_STATE(jdata, PRTE_JOB_STATE_REPORT_PROGRESS);
+                    }
+                }
+            }
+            /* prepare for next job */
+            count = 1;
+            rc = PMIx_Data_unpack(NULL, buffer, &job, &count, PMIX_PROC_NSPACE);
+        }
+        if (PMIX_ERR_UNPACK_READ_PAST_END_OF_BUFFER != rc) {
+            PMIX_ERROR_LOG(rc);
+            rc = prte_pmix_convert_status(rc);
+        } else {
+            rc = PRTE_SUCCESS;
+        }
+        break;
+#endif
 
     default:
         PRTE_ERROR_LOG(PRTE_ERR_VALUE_OUT_OF_BOUNDS);
